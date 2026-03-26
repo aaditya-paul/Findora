@@ -77,7 +77,7 @@ with st.sidebar:
 def render_outfit_card(outfit):
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.image(outfit.image_url, use_container_width=True, caption=f"Source: {outfit.source}")
+        st.image(outfit.image_url, width=420, caption=f"Source: {outfit.source}")
     with col2:
         st.subheader("Outfit Components")
         st.json(outfit.components.model_dump(exclude_none=True))
@@ -105,12 +105,11 @@ def display_response(resp: OutfitRecommendationResponse):
     
     if not resp.outfits:
         st.warning("No outfits could be sourced.")
-        return
-        
-    for i, outfit in enumerate(resp.outfits):
-        st.markdown(f"### Outfit #{i+1}")
-        render_outfit_card(outfit)
-        st.divider()
+    else:
+        for i, outfit in enumerate(resp.outfits):
+            st.markdown(f"### Outfit #{i+1}")
+            render_outfit_card(outfit)
+            st.divider()
         
     c1, c2, c3 = st.columns(3)
     with c1: render_advice(resp.styling_tips, "Styling Tips", "👔")

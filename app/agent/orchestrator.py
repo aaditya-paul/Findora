@@ -41,7 +41,7 @@ class OutfitAgent:
         log.info(f"Agent starting run for query: {query}")
         
         # 1. Scrape Images
-        images = await self.scraper.scrape_pinterest(query, n=3)
+        images = await self.scraper.scrape_pinterest(query, n=6)
         if not images:
             log.warning("No images found for query.")
             return self._empty_response(query)
@@ -100,13 +100,16 @@ class OutfitAgent:
             return resp
         except Exception as e:
             log.error(f"Failed to parse agent final response: {e}. Raw: {raw_json}")
+            fallback_tips = style_tips_raw if isinstance(style_tips_raw, list) else [style_tips_raw]
             # Fallback response
             return OutfitRecommendationResponse(
                 query=query,
                 intent_summary="Fallback Generation due to parsing error",
                 occasion="Unknown",
                 outfits=outfits,
-                styling_tips=style_tips_raw if isinstance(style_tips_raw, list) else [style_tips_raw],
+                styling_tips=fallback_tips,
+                grooming_tips=fallback_tips[:2],
+                confidence_tips=fallback_tips[2:4] if len(fallback_tips) > 2 else fallback_tips[:2],
                 provider_used=provider,
                 model_used=model
             )

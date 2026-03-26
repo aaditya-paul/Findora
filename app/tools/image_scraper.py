@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import time
+import re
 from pathlib import Path
 from playwright.async_api import async_playwright, Page
 
@@ -46,6 +47,75 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+_PINIMG_LOW_RES_SEGMENT = re.compile(r"/(?:75x75|140x|170x|236x|280x280_RS|474x|564x|736x)/")
+_PINIMG_SIZE_SEGMENT = re.compile(r"/(\d+)x(?:\d+_RS)?/")
+
+
+def _promote_pinimg_url(url: str) -> str:
+    if "pinimg.com" not in url:
+        return url
+    if "/originals/" in url:
+        return url
+    return _PINIMG_LOW_RES_SEGMENT.sub("/originals/", url)
+
+
+def _url_quality_score(url: str) -> int:
+    if not url or "pinimg.com" not in url:
+        return -1
+    if "/originals/" in url:
+        return 1_000_000
+    m = _PINIMG_SIZE_SEGMENT.search(url)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _pick_best_from_srcset(srcset: str | None) -> tuple[str | None, str | None, float]:
+    if not srcset:
+        return None, None, -1.0
+
+    best_url = None
+    best_descriptor = None
+    best_score = -1.0
+    best_url_score = -1
+
+    # Format: "url 1x, url 2x" or "url 236w, url 474w"
+    for candidate in srcset.split(","):
+        token = candidate.strip()
+        if not token:
+            continue
+
+        parts = token.split()
+        if not parts:
+            continue
+
+        url = parts[0].strip()
+        descriptor = parts[1].strip() if len(parts) > 1 else ""
+
+        score = 1.0
+        if descriptor.endswith("x"):
+            try:
+                score = float(descriptor[:-1])
+            except ValueError:
+                score = 1.0
+        elif descriptor.endswith("w"):
+            try:
+                score = float(descriptor[:-1])
+            except ValueError:
+                score = 1.0
+
+        url_score = _url_quality_score(url)
+        if score > best_score or (score == best_score and url_score > best_url_score):
+            best_score = score
+            best_url = url
+            best_descriptor = descriptor or None
+            best_url_score = url_score
+
+    return best_url, best_descriptor, best_score
 
 # ---------------------------------------------------------------------------
 # Human-like helpers
@@ -192,12 +262,55 @@ class ImageScraper:
             )
 
             imgs = await page.eval_on_selector_all(
-                "img[src*='pinimg.com']",
-                "els => els.map(e => ({src: e.src, alt: e.alt || ''}))"
+                "img",
+                "els => els.map(e => { const pic = e.closest('picture'); const srcset = e.srcset || e.getAttribute('srcset') || ''; const dataSrcset = e.getAttribute('data-srcset') || ''; const dataSrc = e.getAttribute('data-src') || ''; const sourceSrcset = pic ? Array.from(pic.querySelectorAll('source')).map(s => s.srcset || s.getAttribute('srcset') || '').join(', ') : ''; return ({src: e.src || '', currentSrc: e.currentSrc || '', srcset, dataSrcset, dataSrc, sourceSrcset, alt: e.alt || '', nw: e.naturalWidth || 0, nh: e.naturalHeight || 0}); })"
             )
             log.info(f"[SCRAPER] Found {len(imgs)} raw images")
             await ctx.close()
             await browser.close()
 
-        quality = [i for i in imgs if "236x" not in i["src"] and len(i["src"]) > 30]
+        seen = set()
+        quality = []
+        for i in imgs:
+            srcset_blob = ", ".join(
+                part for part in [
+                    i.get("srcset", ""),
+                    i.get("dataSrcset", ""),
+                    i.get("sourceSrcset", ""),
+                ] if part
+            )
+            best_srcset_url, best_descriptor, best_score = _pick_best_from_srcset(srcset_blob)
+
+            raw_candidates = [
+                best_srcset_url,
+                i.get("currentSrc", ""),
+                i.get("dataSrc", ""),
+                i.get("src", ""),
+            ]
+            raw_candidates = [c for c in raw_candidates if c and "pinimg.com" in c and len(c) > 30]
+            if not raw_candidates:
+                continue
+
+            promoted_candidates = [_promote_pinimg_url(c) for c in raw_candidates]
+            promoted = max(promoted_candidates, key=_url_quality_score)
+
+            nw = int(i.get("nw", 0) or 0)
+            nh = int(i.get("nh", 0) or 0)
+            if nw > 0 and nh > 0 and max(nw, nh) < 220 and _url_quality_score(promoted) < 700:
+                continue
+
+            if promoted in seen:
+                continue
+            seen.add(promoted)
+
+            if best_srcset_url:
+                log.debug(
+                    "[SCRAPER] srcset winner descriptor=%s score=%s url=%s",
+                    best_descriptor,
+                    best_score,
+                    promoted,
+                )
+
+            quality.append({"src": promoted, "alt": i.get("alt", "")})
+
         return quality[:n]
