@@ -50,6 +50,7 @@ _USER_AGENT = (
 
 _PINIMG_LOW_RES_SEGMENT = re.compile(r"/(?:75x75|140x|170x|236x|280x280_RS|474x|564x|736x)/")
 _PINIMG_SIZE_SEGMENT = re.compile(r"/(\d+)x(?:\d+_RS)?/")
+_PINIMG_URL_RE = re.compile(r"https?://i\.pinimg\.com/[^\s\"'<>\\]+")
 
 
 def _promote_pinimg_url(url: str) -> str:
@@ -72,6 +73,32 @@ def _url_quality_score(url: str) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _pick_best_url(candidates: list[str]) -> str | None:
+    filtered = [c for c in candidates if c and "pinimg.com" in c and len(c) > 30]
+    if not filtered:
+        return None
+    promoted = [_promote_pinimg_url(c) for c in filtered]
+    return max(promoted, key=_url_quality_score)
+
+
+def _extract_pinimg_urls_from_html(html: str) -> list[str]:
+    if not html:
+        return []
+
+    # Pinterest often stores image URLs in escaped JSON inside script tags.
+    normalized = html.replace("\\u002F", "/").replace("\\/", "/")
+    urls = _PINIMG_URL_RE.findall(normalized)
+
+    seen = set()
+    out = []
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
 
 
 def _pick_best_from_srcset(srcset: str | None) -> tuple[str | None, str | None, float]:
@@ -265,7 +292,90 @@ class ImageScraper:
                 "img",
                 "els => els.map(e => { const pic = e.closest('picture'); const srcset = e.srcset || e.getAttribute('srcset') || ''; const dataSrcset = e.getAttribute('data-srcset') || ''; const dataSrc = e.getAttribute('data-src') || ''; const sourceSrcset = pic ? Array.from(pic.querySelectorAll('source')).map(s => s.srcset || s.getAttribute('srcset') || '').join(', ') : ''; return ({src: e.src || '', currentSrc: e.currentSrc || '', srcset, dataSrcset, dataSrc, sourceSrcset, alt: e.alt || '', nw: e.naturalWidth || 0, nh: e.naturalHeight || 0}); })"
             )
+
+            pin_links = await page.eval_on_selector_all(
+                "a[href*='/pin/']",
+                "els => [...new Set(els.map(e => e.href).filter(Boolean))]"
+            )
             log.info(f"[SCRAPER] Found {len(imgs)} raw images")
+            log.info(f"[SCRAPER] Found {len(pin_links)} pin links")
+
+            # Open pin detail pages and extract best-quality source (og:image preferred).
+            detail_quality = []
+            for link in pin_links[: max(n * 6, 24)]:
+                if len(detail_quality) >= n:
+                    break
+                detail_page = await ctx.new_page()
+                try:
+                    try:
+                        await detail_page.goto(link, wait_until="domcontentloaded", timeout=20000)
+                    except Exception as e:
+                        log.debug(f"[SCRAPER] Pin page load timeout/failed ({link}): {e}")
+                        await detail_page.close()
+                        continue
+
+                    await _delay(500, 1200)
+
+                    detail_data = await detail_page.evaluate(
+                        """
+                        () => {
+                          const og = document.querySelector('meta[property="og:image"]')?.content || '';
+                          const tw = document.querySelector('meta[name="twitter:image"]')?.content || '';
+                          const imgNodes = Array.from(document.querySelectorAll('img[src*="pinimg.com"]'));
+                          const srcsetParts = imgNodes.map(i => i.srcset || i.getAttribute('srcset') || '').filter(Boolean).join(', ');
+                          const urls = [
+                            og,
+                            tw,
+                            ...imgNodes.map(i => i.currentSrc || ''),
+                            ...imgNodes.map(i => i.getAttribute('data-src') || ''),
+                            ...imgNodes.map(i => i.src || ''),
+                          ].filter(Boolean);
+                          return { urls, srcsetParts };
+                        }
+                        """
+                    )
+
+                    detail_html = await detail_page.content()
+                    html_urls = _extract_pinimg_urls_from_html(detail_html)
+                    if html_urls:
+                        log.debug("[SCRAPER] HTML extraction found %s pinimg URLs", len(html_urls))
+
+                    best_srcset_url, _, _ = _pick_best_from_srcset(detail_data.get("srcsetParts", ""))
+                    candidate_pool = [best_srcset_url] + detail_data.get("urls", []) + html_urls
+                    best = _pick_best_url(candidate_pool)
+                    if not best:
+                        await detail_page.close()
+                        continue
+
+                    if _url_quality_score(best) < 700:
+                        await detail_page.close()
+                        continue
+
+                    detail_quality.append({"src": best, "alt": ""})
+                except Exception as e:
+                    log.debug(f"[SCRAPER] Failed to extract from pin page {link}: {e}")
+                finally:
+                    try:
+                        await detail_page.close()
+                    except Exception:
+                        pass
+
+            if detail_quality:
+                seen_detail = set()
+                final_detail = []
+                for item in detail_quality:
+                    src = item["src"]
+                    if src in seen_detail:
+                        continue
+                    seen_detail.add(src)
+                    final_detail.append(item)
+                    if len(final_detail) >= n:
+                        break
+
+                await ctx.close()
+                await browser.close()
+                return final_detail
+
             await ctx.close()
             await browser.close()
 
